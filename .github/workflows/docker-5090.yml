@@ -135,7 +135,10 @@ jobs:
           docker run --rm "$IMG" llama-cli --version
           docker run --rm "$IMG" llama-perplexity --version
           docker run --rm "$IMG" llama-bench --help > /dev/null
-          docker run --rm "$IMG" test-backend-ops --list-ops | head -n 5
+          # no "| head": with pipefail an early-closed pipe fails the step (SIGPIPE on the writer)
+          n_ops=$(docker run --rm "$IMG" test-backend-ops --list-ops | wc -l)
+          echo "test-backend-ops --list-ops: $n_ops ops"
+          test "$n_ops" -gt 50
           docker run --rm "$IMG" id
           docker run --rm "$IMG" bash -c '
             set -e

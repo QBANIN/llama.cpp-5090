@@ -6,8 +6,8 @@ The GPU host never compiles: it pulls `ghcr.io/qbanin/llama.cpp-5090:<tag>` and 
 ## Image
 
 - Base: `nvidia/cuda:13.5.0-runtime-ubuntu24.04` (runtime), `nvidia/cuda:13.5.0-devel-ubuntu24.04` (build and profiling).
-- Build: `-DCMAKE_CUDA_ARCHITECTURES=120a-real` (SASS for RTX 5090 only, no PTX), `-DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON`, `-DLLAMA_BUILD_TESTS=ON`.
-- Binaries in `/app` (also on `PATH`): `llama-server`, `llama-cli`, `llama-bench`, `llama-perplexity`, `test-backend-ops`, `llama-quantize`, `llama-batched-bench`, `llama-tokenize`, the other tools, examples and `test-*` programs from `build/bin`. Backends are the `libggml-*.so` files next to them.
+- Build: `-DCMAKE_CUDA_ARCHITECTURES=120a-real` (SASS for RTX 5090 only, no PTX), `-DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON`; tests are built as explicit targets because the full suite does not link with `GGML_BACKEND_DL=ON`.
+- Binaries in `/app` (also on `PATH`): `llama-server`, `llama-cli`, `llama-bench`, `llama-perplexity`, `llama-quantize`, `llama-batched-bench`, `llama-tokenize` and the other tools and examples from `build/bin`, plus `test-backend-ops`, `test-backend-tensor`, `test-backend-sampler`, `test-thread-safety`. Backends are the `libggml-*.so` files next to them.
 - Runs as user `llama` (uid 1000). No models, no secrets inside.
 - `*-profiling` tags: same binaries on the devel base plus Nsight Systems (`nsys`) and Nsight Compute (`ncu`), ~17 GB. Built only on `master` and `workflow_dispatch`.
 

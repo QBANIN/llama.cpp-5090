@@ -48,8 +48,9 @@ COPY . .
 COPY --from=web /app/tools/ui/dist tools/ui/dist
 
 # GGML_NATIVE=OFF + GGML_CPU_ALL_VARIANTS=ON: the CPU of the CI runner is not the CPU of the GPU host.
-# LLAMA_BUILD_TESTS=ON: test-backend-ops is required on the GPU host.
-RUN cmake -B build -G Ninja \
+# The full test suite does not link with GGML_BACKEND_DL=ON (test-kv-cache uses CPU backend symbols),
+# so the tests needed on the GPU host are built as explicit targets in a second pass.
+RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH} \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
@@ -57,11 +58,13 @@ RUN cmake -B build -G Ninja \
         -DGGML_CUDA=ON \
         -DGGML_BACKEND_DL=ON \
         -DGGML_CPU_ALL_VARIANTS=ON \
-        -DLLAMA_BUILD_TESTS=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_TOOLS=ON \
-        -DLLAMA_BUILD_SERVER=ON \
-        . && \
-    cmake --build build --config Release -j${BUILD_JOBS:-$(nproc)}
+        -DLLAMA_BUILD_SERVER=ON && \
+    cmake --build build --config Release -j${BUILD_JOBS:-$(nproc)} && \
+    cmake -S . -B build -DLLAMA_BUILD_TESTS=ON && \
+    cmake --build build --config Release -j${BUILD_JOBS:-$(nproc)} \
+        --target test-backend-ops test-backend-tensor test-backend-sampler test-thread-safety
 
 RUN mkdir -p /app/lib /app/bin && \
     find build -name "*.so*" -exec cp -P {} /app/lib \; && \

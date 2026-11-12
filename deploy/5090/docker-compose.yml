@@ -1,0 +1,79 @@
+# Runs the prebuilt llama.cpp-5090 images from GHCR on the RTX 5090 host. Nothing is compiled here.
+# Configuration: copy .env.example to .env. Usage: see README.md in this directory.
+
+x-llama: &llama
+  image: ghcr.io/qbanin/llama.cpp-5090:${LLAMA_TAG:-latest}
+  pull_policy: ${LLAMA_PULL_POLICY:-missing}
+  volumes:
+    - ${MODELS_DIR:?set MODELS_DIR in .env}:/models:ro
+  environment:
+    CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  shm_size: ${LLAMA_SHM_SIZE:-2g}
+  # pinned host memory (cudaHostAlloc / --mlock / MoE expert cache) is limited by memlock
+  ulimits:
+    memlock: -1
+    stack: 67108864
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  # OpenAI-compatible server; llama-server reads LLAMA_ARG_* from the environment
+  server:
+    <<: *llama
+    entrypoint: ["llama-server"]
+    command: ${LLAMA_SERVER_ARGS:-}
+    environment:
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      LLAMA_ARG_MODEL: /models/${LLAMA_MODEL:?set LLAMA_MODEL in .env}
+      LLAMA_ARG_N_GPU_LAYERS: ${LLAMA_NGL:-999}
+      LLAMA_ARG_CTX_SIZE: ${LLAMA_CTX:-8192}
+      LLAMA_ARG_FLASH_ATTN: ${LLAMA_FA:-on}
+    ports:
+      - "${LLAMA_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+    restart: unless-stopped
+
+  # one-shot: docker compose run --rm bench [llama-bench args]
+  bench:
+    <<: *llama
+    profiles: [bench]
+    entrypoint: ["llama-bench"]
+    command: -m /models/${LLAMA_MODEL:-model.gguf} ${LLAMA_BENCH_ARGS:--fa 1 -p 512 -n 128}
+    restart: "no"
+
+  # one-shot: docker compose run --rm test [test-backend-ops args]
+  test:
+    <<: *llama
+    profiles: [test]
+    entrypoint: ["test-backend-ops"]
+    command: test -b CUDA0
+    restart: "no"
+
+  # one-shot, profiling image (nsys + ncu); reports land in ${REPORTS_DIR}
+  profile:
+    <<: *llama
+    profiles: [profile]
+    image: ghcr.io/qbanin/llama.cpp-5090:${LLAMA_TAG:-latest}-profiling
+    # ncu needs an effective CAP_SYS_ADMIN for GPU performance counters, which a non-root container user cannot hold
+    user: root
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - ${MODELS_DIR:?set MODELS_DIR in .env}:/models:ro
+      - ${REPORTS_DIR:-./reports}:/reports
+    working_dir: /reports
+    entrypoint: ["nsys"]
+    command: profile --stats=true -o /reports/llama-bench llama-bench -m /models/${LLAMA_MODEL:-model.gguf} ${LLAMA_BENCH_ARGS:--fa 1 -p 512 -n 128}
+    restart: "no"

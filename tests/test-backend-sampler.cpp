@@ -737,6 +737,306 @@ static void test_top_p(const test_params & params) {
     printf("top-p sampling test PASSED\n");
 }
 
+// apply a CPU sampler to a copy of the raw logits and return the entries that remain
+static std::vector<llama_token_data> apply_cpu_sampler_to_logits(
+        const llama_sampler * cpu_sampler,
+        const float * raw_logits,
+        size_t n_vocab) {
+    std::vector<llama_token_data> cur(n_vocab);
+    for (size_t i = 0; i < n_vocab; ++i) {
+        cur[i] = { /* .id = */ (llama_token) i, /* .logit = */ raw_logits[i], /* .p = */ 0.0f };
+    }
+
+    llama_token_data_array cur_p = {
+        /* .data     = */ cur.data(),
+        /* .size     = */ cur.size(),
+        /* .selected = */ -1,
+        /* .sorted   = */ false,
+    };
+
+    llama_sampler_apply(const_cast<llama_sampler *>(cpu_sampler), &cur_p);
+
+    return std::vector<llama_token_data>(cur_p.data, cur_p.data + cur_p.size);
+}
+
+static void test_typical(const test_params & params) {
+    const int seq_id = 0;
+    const float  p = 0.9f;
+    const size_t min_keep = 1;
+
+    struct llama_sampler_chain_params backend_chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_chain_params));
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_typical(p, min_keep));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, backend_sampler_chain.get() }};
+
+    test_context test_ctx(params, backend_sampler_configs);
+
+    if (!test_ctx.decode({{seq_id, "Hello"}})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    int32_t batch_idx = test_ctx.idx_for_seq(seq_id);
+
+    const float * raw_logits     = llama_get_logits_ith(test_ctx.ctx.get(), batch_idx);
+    float *       backend_logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx);
+    uint32_t      n_vocab        = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), batch_idx);
+
+    GGML_ASSERT(raw_logits != nullptr);
+    GGML_ASSERT(backend_logits != nullptr);
+    GGML_ASSERT(n_vocab == (uint32_t) test_ctx.n_vocab);
+
+    // The CPU version computes entropy with logf(p) and produces NaN for entries with logit = -inf,
+    // so the reference is run only on the entries with finite logits
+    std::vector<llama_token_data> cpu_cur;
+    std::vector<llama_token> cpu_ids;
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        if (std::isfinite(raw_logits[i])) {
+            cpu_cur.push_back({ /* .id = */ (llama_token) cpu_ids.size(), /* .logit = */ raw_logits[i], /* .p = */ 0.0f });
+            cpu_ids.push_back((llama_token) i);
+        }
+    }
+
+    llama_sampler_ptr cpu_sampler(llama_sampler_init_typical(p, min_keep));
+    llama_token_data_array cur_p = {
+        /* .data     = */ cpu_cur.data(),
+        /* .size     = */ cpu_cur.size(),
+        /* .selected = */ -1,
+        /* .sorted   = */ false,
+    };
+    llama_sampler_apply(cpu_sampler.get(), &cur_p);
+    GGML_ASSERT(cur_p.size > 0);
+    GGML_ASSERT(cur_p.size < cpu_cur.size());
+
+    std::vector<llama_token> cpu_kept;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        cpu_kept.push_back(cpu_ids[cur_p.data[i].id]);
+    }
+
+    // The backend result must keep exactly the same set of tokens, with unchanged logits
+    size_t n_kept_backend = 0;
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        if (backend_logits[i] > -1e30f) n_kept_backend++;
+    }
+    printf("DEBUG typical: cpu_kept=%zu backend_kept=%zu\n", cpu_kept.size(), n_kept_backend);
+    {
+        std::vector<int> only_cpu, only_backend;
+        for (llama_token id : cpu_kept) {
+            if (backend_logits[id] <= -1e30f) only_cpu.push_back(id);
+        }
+        for (uint32_t i = 0; i < n_vocab; ++i) {
+            bool in_cpu = false;
+            for (llama_token id : cpu_kept) if (id == i) { in_cpu = true; break; }
+            if (!in_cpu && backend_logits[i] > -1e30f) only_backend.push_back((int)i);
+        }
+        for (int id : only_cpu) printf("DEBUG only_cpu: id=%d raw=%.6f\n", id, raw_logits[id]);
+        for (int id : only_backend) printf("DEBUG only_backend: id=%d raw=%.6f\n", id, raw_logits[id]);
+    }
+    GGML_ASSERT(n_kept_backend == cpu_kept.size());
+
+    for (llama_token id : cpu_kept) {
+        const float backend_logit = backend_logits[id];
+        GGML_ASSERT(backend_logit > -1e30f);
+        GGML_ASSERT(std::fabs(backend_logit - raw_logits[id]) < 1e-4f);
+    }
+
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        bool in_kept = false;
+        for (llama_token id : cpu_kept) {
+            if (id == i) {
+                in_kept = true;
+                break;
+            }
+        }
+        if (!in_kept) {
+            GGML_ASSERT(backend_logits[i] < -1e30f);
+        }
+    }
+
+    // Sample using CPU sampler on top of the backend-modified logits
+    struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+
+    llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), batch_idx);
+    const std::string token_str = test_ctx.token_to_piece(token, false);
+    printf("typical cpu sampled token id:%d, string: '%s'\n", token, token_str.c_str());
+    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+
+    for (int i = 0; i < 10; i++) {
+        int32_t loop_idx = test_ctx.idx_for_seq(seq_id);
+        llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), loop_idx);
+        printf("typical gen step %d: token id :%5.d, string: %s\n", i, token, test_ctx.token_to_piece(token, false).c_str());
+        if (!test_ctx.decode_token(token, 0)) {
+            GGML_ASSERT(false && "Failed to decode token");
+        }
+    }
+
+    printf("typical sampling test PASSED\n");
+}
+
+static void test_top_n_sigma(const test_params & params) {
+    const int seq_id = 0;
+    const float n_sigma = 2.0f;
+
+    struct llama_sampler_chain_params backend_chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_chain_params));
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_top_n_sigma(n_sigma));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, backend_sampler_chain.get() }};
+
+    test_context test_ctx(params, backend_sampler_configs);
+
+    if (!test_ctx.decode({{seq_id, "Hello"}})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    int32_t batch_idx = test_ctx.idx_for_seq(seq_id);
+
+    const float * raw_logits     = llama_get_logits_ith(test_ctx.ctx.get(), batch_idx);
+    float *       backend_logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx);
+    uint32_t      n_vocab        = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), batch_idx);
+
+    GGML_ASSERT(raw_logits != nullptr);
+    GGML_ASSERT(backend_logits != nullptr);
+    GGML_ASSERT(n_vocab == (uint32_t) test_ctx.n_vocab);
+
+    // CPU reference: masks in place, the array size does not change
+    llama_sampler_ptr cpu_sampler(llama_sampler_init_top_n_sigma(n_sigma));
+    std::vector<llama_token_data> cpu_data(n_vocab);
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        cpu_data[i] = { /* .id = */ (llama_token) i, /* .logit = */ raw_logits[i], /* .p = */ 0.0f };
+    }
+    llama_token_data_array cur_p = {
+        /* .data     = */ cpu_data.data(),
+        /* .size     = */ cpu_data.size(),
+        /* .selected = */ -1,
+        /* .sorted   = */ false,
+    };
+    llama_sampler_apply(cpu_sampler.get(), &cur_p);
+    GGML_ASSERT(cur_p.size == n_vocab);
+
+    // The same entries must be masked in both results
+    size_t n_masked = 0;
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        const bool cpu_masked     = (cur_p.data[i].logit == -INFINITY);
+        const bool backend_masked = (backend_logits[i] == -INFINITY);
+        GGML_ASSERT(cpu_masked == backend_masked);
+
+        if (cpu_masked) {
+            n_masked++;
+        } else {
+            GGML_ASSERT(std::fabs(backend_logits[i] - raw_logits[i]) < 1e-4f);
+        }
+    }
+
+    GGML_ASSERT(n_masked > 0);
+    GGML_ASSERT(n_masked < n_vocab);
+
+    // Sample using CPU sampler on top of the backend-modified logits
+    struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+
+    llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), batch_idx);
+    const std::string token_str = test_ctx.token_to_piece(token, false);
+    printf("top-n-sigma cpu sampled token id:%d, string: '%s'\n", token, token_str.c_str());
+    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+
+    for (int i = 0; i < 10; i++) {
+        int32_t loop_idx = test_ctx.idx_for_seq(seq_id);
+        llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), loop_idx);
+        printf("top-n-sigma gen step %d: token id :%5.d, string: %s\n", i, token, test_ctx.token_to_piece(token, false).c_str());
+        if (!test_ctx.decode_token(token, 0)) {
+            GGML_ASSERT(false && "Failed to decode token");
+        }
+    }
+
+    printf("top-n-sigma sampling test PASSED\n");
+}
+
+static void test_xtc(const test_params & params) {
+    const int seq_id    = 0;
+    const float  probability = 1.0f; // always apply the cutoff (CPU never takes the early-return path)
+    const float  threshold   = 0.1f;
+    const size_t min_keep    = 2;
+    const uint32_t seed      = 42;
+
+    struct llama_sampler_chain_params backend_chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_chain_params));
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_xtc(probability, threshold, min_keep, seed));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, backend_sampler_chain.get() }};
+
+    test_context test_ctx(params, backend_sampler_configs);
+
+    if (!test_ctx.decode({{seq_id, "Hello"}})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    int32_t batch_idx = test_ctx.idx_for_seq(seq_id);
+
+    const float * raw_logits     = llama_get_logits_ith(test_ctx.ctx.get(), batch_idx);
+    float *       backend_logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx);
+    uint32_t      n_vocab        = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), batch_idx);
+
+    GGML_ASSERT(raw_logits != nullptr);
+    GGML_ASSERT(backend_logits != nullptr);
+    GGML_ASSERT(n_vocab == (uint32_t) test_ctx.n_vocab);
+
+    // CPU reference: with probability = 1.0 the cutoff is always applied and is deterministic.
+    // It sorts by probability and drops all but the last of the entries with p >= threshold.
+    llama_sampler_ptr cpu_sampler(llama_sampler_init_xtc(probability, threshold, min_keep, seed));
+    std::vector<llama_token_data> cpu_kept = apply_cpu_sampler_to_logits(cpu_sampler.get(), raw_logits, n_vocab);
+
+    GGML_ASSERT(cpu_kept.size() > 0);
+    GGML_ASSERT(cpu_kept.size() < n_vocab);
+
+    // The backend result must keep exactly the same set of tokens, with unchanged logits
+    size_t n_kept_backend = 0;
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        if (backend_logits[i] > -1e30f) n_kept_backend++;
+    }
+    GGML_ASSERT(n_kept_backend == cpu_kept.size());
+
+    for (const auto & td : cpu_kept) {
+        const float backend_logit = backend_logits[td.id];
+        GGML_ASSERT(backend_logit > -1e30f);
+        GGML_ASSERT(std::fabs(backend_logit - raw_logits[td.id]) < 1e-4f);
+    }
+
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        bool in_kept = false;
+        for (const auto & td : cpu_kept) {
+            if (td.id == i) {
+                in_kept = true;
+                break;
+            }
+        }
+        if (!in_kept) {
+            GGML_ASSERT(backend_logits[i] < -1e30f);
+        }
+    }
+
+    // Sample using CPU sampler on top of the backend-modified logits
+    struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+
+    llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), batch_idx);
+    const std::string token_str = test_ctx.token_to_piece(token, false);
+    printf("xtc cpu sampled token id:%d, string: '%s'\n", token, token_str.c_str());
+    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+
+    for (int i = 0; i < 10; i++) {
+        int32_t loop_idx = test_ctx.idx_for_seq(seq_id);
+        llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), loop_idx);
+        printf("xtc gen step %d: token id :%5.d, string: %s\n", i, token, test_ctx.token_to_piece(token, false).c_str());
+        if (!test_ctx.decode_token(token, 0)) {
+            GGML_ASSERT(false && "Failed to decode token");
+        }
+    }
+
+    printf("xtc sampling test PASSED\n");
+}
+
 static void test_multi_sequence(const test_params & params) {
     struct llama_sampler_chain_params chain_params_0 = llama_sampler_chain_default_params();
     llama_sampler_ptr sampler_chain_0(llama_sampler_chain_init(chain_params_0));
@@ -2077,6 +2377,9 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_top_k",                  test_top_k,                  true },
     { "test_top_p",                  test_top_p,                  true },
     { "test_min_p",                  test_min_p,                  true },
+    { "test_typical",                test_typical,                true },
+    { "test_top_n_sigma",            test_top_n_sigma,            true },
+    { "test_xtc",                    test_xtc,                    true },
     { "test_logit_bias",             test_logit_bias,             true },
     { "test_penalties",              test_penalties,              true },
     // multiple sequences

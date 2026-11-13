@@ -3559,20 +3559,23 @@ static void llama_sampler_top_n_sigma_backend_apply(
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
 
     // valid_mask = 1 for logits that are not -INFINITY (the CPU version skips them in mean/std)
-    struct ggml_tensor * valid_mask = ggml_step(ctx, ggml_scale(ctx, logits, -1.0f));
-    struct ggml_tensor * count      = ggml_sum(ctx, valid_mask);
+    struct ggml_tensor * valid_mask = ggml_step(ctx, ggml_add(ctx, logits, ggml_fill(ctx, logits, 1e30f)));
+
+    // replace -INF with a finite sentinel so that masked sums stay finite (-inf * 0 = NaN would poison mean/std)
+    struct ggml_tensor * logits_safe = ggml_clamp(ctx, logits, -1e30f, 1e30f);
 
     // guard against division by zero when all logits are -INFINITY (CPU returns 0 then)
+    struct ggml_tensor * count      = ggml_sum(ctx, valid_mask);
     struct ggml_tensor * count_safe = ggml_add(ctx, count, ggml_sub(ctx, ggml_fill(ctx, count, 1.0f), ggml_step(ctx, count)));
 
     // mean of the valid logits
-    struct ggml_tensor * masked     = ggml_mul(ctx, logits, valid_mask);
+    struct ggml_tensor * masked     = ggml_mul(ctx, logits_safe, valid_mask);
     struct ggml_tensor * masked_sum = ggml_sum(ctx, masked);
     struct ggml_tensor * mean       = ggml_div(ctx, masked_sum, count_safe);
     ggml_set_name(mean, "top_n_sigma_mean");
 
     // standard deviation of the valid logits
-    struct ggml_tensor * diff     = ggml_sub(ctx, masked, mean);
+    struct ggml_tensor * diff     = ggml_mul(ctx, valid_mask, ggml_sub(ctx, logits_safe, mean));
     struct ggml_tensor * diff_sq  = ggml_mul(ctx, diff, diff);
     struct ggml_tensor * diff_sum = ggml_sum(ctx, diff_sq);
     struct ggml_tensor * var      = ggml_div(ctx, diff_sum, count_safe);

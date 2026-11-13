@@ -18,6 +18,7 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
+#include "../../src/llama-sampler.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -2059,6 +2060,11 @@ private:
         if (task.need_sampling()) {
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+
+                // rejection sampling needs the full distribution (probs + candidates) on the host
+                if (slot.can_speculate() && slot.use_spec_rejection()) {
+                    llama_sampler_chain_set_token_only(common_sampler_get(slot.smpl.get()), false);
+                }
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);

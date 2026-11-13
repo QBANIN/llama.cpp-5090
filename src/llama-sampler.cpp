@@ -1442,6 +1442,30 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
     }
 }
 
+bool llama_sampler_chain_is_token_only(const struct llama_sampler * sampler) {
+    GGML_ASSERT(sampler != nullptr);
+
+    if (sampler->iface != &llama_sampler_chain_i) {
+        GGML_ABORT("%s: invalid sampler passed - requires a sampler created with llama_sampler_chain_init()\n", __func__);
+    }
+
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+
+    return chain->params.token_only;
+}
+
+void llama_sampler_chain_set_token_only(struct llama_sampler * sampler, bool token_only) {
+    GGML_ASSERT(sampler != nullptr);
+
+    if (sampler->iface != &llama_sampler_chain_i) {
+        GGML_ABORT("%s: invalid sampler passed - requires a sampler created with llama_sampler_chain_init()\n", __func__);
+    }
+
+    auto * chain = (llama_sampler_chain *) sampler->ctx;
+
+    chain->params.token_only = token_only;
+}
+
 // top-k
 
 struct llama_sampler_top_k : public llama_sampler_backend {

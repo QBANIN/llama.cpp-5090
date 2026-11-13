@@ -465,7 +465,8 @@ extern "C" {
     } llama_logit_bias;
 
     typedef struct llama_sampler_chain_params {
-        bool no_perf; // whether to measure performance timings
+        bool no_perf;     // whether to measure performance timings
+        bool token_only;  // publish only the sampled token; do not copy probs/logits/candidates to the host
     } llama_sampler_chain_params;
 
     // used in chat template

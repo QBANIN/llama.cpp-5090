@@ -1905,13 +1905,20 @@ struct llama_sampler * llama_sampler_init_min_p(float p, size_t min_keep) {
 
 // typical
 
-struct llama_sampler_typical {
+struct llama_sampler_typical : public llama_sampler_backend {
     const float  p;
     const size_t min_keep;
+
+    llama_sampler_typical(float p, size_t min_keep)
+        : llama_sampler_backend("typical")
+        , p        (p)
+        , min_keep (min_keep) {
+    }
 };
 
-static const char * llama_sampler_typical_name(const struct llama_sampler * /*smpl*/) {
-    return "typical";
+static const char * llama_sampler_typical_name(const struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_typical *) smpl->ctx;
+    return sctx->get_name();
 }
 
 static void llama_sampler_typical_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
@@ -1983,6 +1990,114 @@ static void llama_sampler_typical_free(struct llama_sampler * smpl) {
     delete (llama_sampler_typical *) smpl->ctx;
 }
 
+static bool llama_sampler_typical_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    auto * sctx = (llama_sampler_typical *) smpl->ctx;
+
+    GGML_UNUSED(n_outputs_max_per_seq);
+
+    const bool res = llama_sampler_backend_support(smpl, buft);
+
+    sctx->init(res);
+
+    return res;
+}
+
+static void llama_sampler_typical_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    auto * sctx = (llama_sampler_typical *) smpl->ctx;
+
+    GGML_UNUSED(gf);
+
+    // flatten
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+
+    auto ggml_sort = [ctx](struct ggml_tensor * a, struct ggml_tensor * b) {
+        GGML_ASSERT(ggml_nrows(a) == 1);
+        struct ggml_tensor * a_reshaped = ggml_reshape_2d(ctx, a, 1, a->ne[0]);
+        struct ggml_tensor * a_sorted   = ggml_get_rows(ctx, a_reshaped, b);
+        return ggml_reshape_1d(ctx, a_sorted, ggml_nelements(a_sorted));
+    };
+
+    // Compute the softmax of the logits
+    struct ggml_tensor * probs = ggml_soft_max(ctx, logits);
+    ggml_set_name(probs, "typical_probs");
+
+    struct ggml_tensor * valid_p = ggml_step(ctx, probs);
+    struct ggml_tensor * zero_p  = ggml_sub(ctx, ggml_fill(ctx, valid_p, 1.0f), valid_p);
+
+    // For zero-probability entries ln(p) = -INF; use a finite floor so that
+    // p * ln(p_safe) = 0 instead of 0 * (-INF) = NaN
+    struct ggml_tensor * p_safe  = ggml_add(ctx, probs, ggml_mul(ctx, zero_p, ggml_fill(ctx, probs, FLT_MIN)));
+    struct ggml_tensor * ln_safe = ggml_log(ctx, p_safe);
+
+    // Entropy: sum(-p * ln(p))
+    struct ggml_tensor * entropy_terms = ggml_mul(ctx, probs, ln_safe);
+    struct ggml_tensor * entropy       = ggml_scale(ctx, ggml_sum(ctx, entropy_terms), -1.0f);
+    ggml_set_name(entropy, "typical_entropy");
+
+    // Shifted score: |(-ln(p)) - entropy|; the CPU version assigns +INF to zero-probability
+    // entries (they sort to the end), which we reproduce with a large finite value
+    struct ggml_tensor * neg_ln       = ggml_scale(ctx, ln_safe, -1.0f);
+    struct ggml_tensor * shifted_real = ggml_abs(ctx, ggml_sub(ctx, neg_ln, entropy));
+    struct ggml_tensor * shifted      = ggml_add(ctx,
+            ggml_mul(ctx, shifted_real, valid_p),
+            ggml_mul(ctx, zero_p, ggml_fill(ctx, probs, 1e30f)));
+    ggml_set_name(shifted, "typical_shifted");
+
+    // Sort the tokens in ascending order of the shifted score
+    struct ggml_tensor * sorted_idx = ggml_argsort(ctx, shifted, GGML_SORT_ORDER_ASC);
+    ggml_set_name(sorted_idx, "typical_sorted_idx");
+
+    struct ggml_tensor * sorted_logits = ggml_sort(logits, sorted_idx);
+    ggml_set_name(sorted_logits, "typical_sorted_logits");
+
+    struct ggml_tensor * sorted_probs = ggml_sort(probs, sorted_idx);
+    ggml_set_name(sorted_probs, "typical_sorted_probs");
+
+    // If candidates are provided, sort them as well. Otherwise, set the sorted indices as candidates.
+    if (data->candidates != nullptr) {
+        struct ggml_tensor * candidates = ggml_reshape_1d(ctx, data->candidates, ggml_nelements(data->candidates));
+        data->candidates = ggml_sort(candidates, sorted_idx);
+    } else {
+        data->candidates = sorted_idx;
+    }
+    ggml_set_name(data->candidates, "typical_candidates");
+
+    // Cumulative probabilities in sorted order
+    struct ggml_tensor * cdf = ggml_cumsum(ctx, sorted_probs);
+    ggml_set_name(cdf, "typical_cdf");
+
+    // crossed[i] = 1 iff cdf[i] > p (strict, matching the CPU version)
+    struct ggml_tensor * crossed = ggml_step(ctx, ggml_sub(ctx, cdf, ggml_fill(ctx, cdf, sctx->p)));
+
+    // rank[i] + 1; the CPU version breaks when rank + 1 >= min_keep (or min_keep == 0)
+    struct ggml_tensor * rank  = ggml_arange(ctx, 0.0f, (float) sorted_probs->ne[0], 1.0f);
+    struct ggml_tensor * rank1 = ggml_add(ctx, rank, ggml_fill(ctx, rank, 1.0f));
+    struct ggml_tensor * meets_min_keep = ggml_sub(ctx, ggml_fill(ctx, rank, 1.0f),
+            ggml_step(ctx, ggml_sub(ctx, ggml_fill(ctx, rank, (float) sctx->min_keep), rank1)));
+
+    // cond is 1 only at ranks where both the probability and min_keep conditions hold;
+    // the first such rank is the break point
+    struct ggml_tensor * cond     = ggml_mul(ctx, crossed, meets_min_keep);
+    struct ggml_tensor * cond_cnt = ggml_cumsum(ctx, cond);
+
+    // Keep the entries up to and including the break point
+    struct ggml_tensor * mask = ggml_sub(ctx, ggml_fill(ctx, cond_cnt, 1.0f),
+            ggml_step(ctx, ggml_sub(ctx, cond_cnt, ggml_fill(ctx, cond_cnt, 1.5f))));
+    ggml_set_name(mask, "typical_mask");
+
+    // Apply -INFINITY bias for masked-out tokens: log(1) = 0 (keep), log(0) = -INF (discard)
+    struct ggml_tensor * bias = ggml_log(ctx, mask);
+    data->logits = ggml_add(ctx, sorted_logits, bias);
+    ggml_set_name(data->logits, "typical_logits");
+}
+
 static struct llama_sampler_i llama_sampler_typical_i = {
     /* .name              = */ llama_sampler_typical_name,
     /* .accept            = */ nullptr,
@@ -1990,12 +2105,12 @@ static struct llama_sampler_i llama_sampler_typical_i = {
     /* .reset             = */ nullptr,
     /* .clone             = */ llama_sampler_typical_clone,
     /* .free              = */ llama_sampler_typical_free,
-    /* .backend_init      = */ nullptr,
+    /* .backend_init      = */ llama_sampler_typical_backend_init,
     /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_typical_backend_apply,
     /* .backend_set_input = */ nullptr,
     /* .backend_reset     = */ nullptr,
-    /* .copy_state        = */ nullptr,
+    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_typical>,
 };
 
 struct llama_sampler * llama_sampler_init_typical(float p, size_t min_keep) {
@@ -2007,10 +2122,9 @@ struct llama_sampler * llama_sampler_init_typical(float p, size_t min_keep) {
 
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_typical_i,
-        /* .ctx   = */ new llama_sampler_typical {
-            /* .p        = */ p,
-            /* .min_keep = */ min_keep,
-        }
+        /* .ctx   = */ new llama_sampler_typical(
+            p,
+            min_keep)
     );
 }
 

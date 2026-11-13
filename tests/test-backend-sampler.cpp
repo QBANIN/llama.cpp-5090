@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
@@ -735,6 +736,128 @@ static void test_top_p(const test_params & params) {
     }
 
     printf("top-p sampling test PASSED\n");
+}
+
+static void test_typical(const test_params & params) {
+    const int seq_id     = 0;
+    const int raw_seq_id = 1;   // no backend sampler: its llama_get_logits_ith() returns the raw model logits
+    const float  p = 0.9f;
+    const size_t min_keep = 1;
+
+    struct llama_sampler_chain_params backend_chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_chain_params));
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_typical(p, min_keep));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, backend_sampler_chain.get() }};
+
+    // n_seq_max = 2: the CPU reference below must run on the true raw model logits.
+    // llama_get_logits_ith() returns the backend-sampled logits for seq 0 (the sampled
+    // region takes precedence), so the reference is read from a second sequence that
+    // decodes the same prompt without a backend sampler.
+    test_context test_ctx(params, backend_sampler_configs, 2);
+
+    if (!test_ctx.decode({{ seq_id, "Hello" }, { raw_seq_id, "Hello" }})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    int32_t batch_idx     = test_ctx.idx_for_seq(seq_id);
+    int32_t raw_batch_idx = test_ctx.idx_for_seq(raw_seq_id);
+
+    const float * raw_logits     = llama_get_logits_ith(test_ctx.ctx.get(), raw_batch_idx);
+    float *       backend_logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx);
+    uint32_t      n_vocab        = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), batch_idx);
+
+    GGML_ASSERT(raw_logits != nullptr);
+    GGML_ASSERT(backend_logits != nullptr);
+    GGML_ASSERT(n_vocab == (uint32_t) test_ctx.n_vocab);
+
+    // The CPU version computes entropy with logf(p) and produces NaN for entries with
+    // p = 0, so the reference is run only on the entries with finite logits
+    std::vector<llama_token_data> cpu_cur;
+    std::vector<llama_token> cpu_ids;
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        if (std::isfinite(raw_logits[i])) {
+            cpu_cur.push_back({ /* .id = */ (llama_token) cpu_ids.size(), /* .logit = */ raw_logits[i], /* .p = */ 0.0f });
+            cpu_ids.push_back((llama_token) i);
+        }
+    }
+
+    llama_sampler_ptr cpu_sampler(llama_sampler_init_typical(p, min_keep));
+    llama_token_data_array cur_p = {
+        /* .data     = */ cpu_cur.data(),
+        /* .size     = */ cpu_cur.size(),
+        /* .selected = */ -1,
+        /* .sorted   = */ false,
+    };
+    llama_sampler_apply(cpu_sampler.get(), &cur_p);
+    GGML_ASSERT(cur_p.size > 0);
+    GGML_ASSERT(cur_p.size < cpu_cur.size());
+
+    std::vector<llama_token> cpu_kept;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        cpu_kept.push_back(cpu_ids[cur_p.data[i].id]);
+    }
+
+    // The backend output is in sorted order; candidates map position -> original token id
+    const llama_token * candidates    = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), batch_idx);
+    uint32_t n_candidates             = llama_get_sampled_candidates_count_ith(test_ctx.ctx.get(), batch_idx);
+    GGML_ASSERT(candidates != nullptr);
+    GGML_ASSERT(n_candidates == n_vocab);
+
+    std::vector<llama_token> backend_kept;
+    for (uint32_t i = 0; i < n_candidates; ++i) {
+        if (backend_logits[i] > -1e30f) backend_kept.push_back(candidates[i]);
+    }
+
+    auto in_cpu_kept = [&cpu_kept](llama_token id) {
+        for (llama_token k : cpu_kept) if (k == id) return true;
+        return false;
+    };
+    auto in_backend_kept = [&backend_kept](llama_token id) {
+        for (llama_token k : backend_kept) if (k == id) return true;
+        return false;
+    };
+
+    // Both implementations are float: rounding in the softmax/cumsum can move the
+    // "cdf > p" boundary by a token or two (a wrong formula or off-by-one would differ
+    // by dozens). Assert semantic equivalence as a near-identical kept set.
+    size_t n_sym_diff = 0;
+    for (llama_token id : cpu_kept) {
+        if (!in_backend_kept(id)) n_sym_diff++;
+    }
+    for (llama_token id : backend_kept) {
+        if (!in_cpu_kept(id)) n_sym_diff++;
+    }
+    GGML_ASSERT(n_sym_diff <= 2);
+    GGML_ASSERT(backend_kept.size() > 0);
+    GGML_ASSERT(backend_kept.size() < n_vocab);
+
+    // unmasked entries in the backend output must carry the original raw logit values
+    for (uint32_t i = 0; i < n_candidates; ++i) {
+        if (backend_logits[i] > -1e30f) {
+            GGML_ASSERT(std::fabs(backend_logits[i] - raw_logits[candidates[i]]) < 1e-4f);
+        }
+    }
+
+    // Sample using CPU sampler on top of the backend-modified logits
+    struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+
+    llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), batch_idx);
+    const std::string token_str = test_ctx.token_to_piece(token, false);
+    printf("typical cpu sampled token id:%d, string: '%s'\n", token, token_str.c_str());
+    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+
+    for (int i = 0; i < 10; i++) {
+        int32_t loop_idx = test_ctx.idx_for_seq(seq_id);
+        llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), loop_idx);
+        printf("typical gen step %d: token id :%5.d, string: %s\n", i, token, test_ctx.token_to_piece(token, false).c_str());
+        if (!test_ctx.decode_token(token, 0)) {
+            GGML_ASSERT(false && "Failed to decode token");
+        }
+    }
+
+    printf("typical sampling test PASSED\n");
 }
 
 static void test_multi_sequence(const test_params & params) {
@@ -2077,6 +2200,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_top_k",                  test_top_k,                  true },
     { "test_top_p",                  test_top_p,                  true },
     { "test_min_p",                  test_min_p,                  true },
+    { "test_typical",                test_typical,                true },
     { "test_logit_bias",             test_logit_bias,             true },
     { "test_penalties",              test_penalties,              true },
     // multiple sequences

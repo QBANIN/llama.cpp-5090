@@ -738,6 +738,28 @@ static void test_top_p(const test_params & params) {
     printf("top-p sampling test PASSED\n");
 }
 
+// apply a CPU sampler to a copy of the raw logits and return the entries that remain
+static std::vector<llama_token_data> apply_cpu_sampler_to_logits(
+        const llama_sampler * cpu_sampler,
+        const float * raw_logits,
+        size_t n_vocab) {
+    std::vector<llama_token_data> cur(n_vocab);
+    for (size_t i = 0; i < n_vocab; ++i) {
+        cur[i] = { /* .id = */ (llama_token) i, /* .logit = */ raw_logits[i], /* .p = */ 0.0f };
+    }
+
+    llama_token_data_array cur_p = {
+        /* .data     = */ cur.data(),
+        /* .size     = */ cur.size(),
+        /* .selected = */ -1,
+        /* .sorted   = */ false,
+    };
+
+    llama_sampler_apply(const_cast<llama_sampler *>(cpu_sampler), &cur_p);
+
+    return std::vector<llama_token_data>(cur_p.data, cur_p.data + cur_p.size);
+}
+
 static void test_typical(const test_params & params) {
     const int seq_id     = 0;
     const int raw_seq_id = 1;   // no backend sampler: its llama_get_logits_ith() returns the raw model logits
@@ -858,6 +880,101 @@ static void test_typical(const test_params & params) {
     }
 
     printf("typical sampling test PASSED\n");
+}
+
+static void test_top_n_sigma(const test_params & params) {
+    const int seq_id     = 0;
+    const int raw_seq_id = 1;   // no backend sampler: its llama_get_logits_ith() returns the raw model logits
+    const float n_sigma = 2.0f;
+
+    struct llama_sampler_chain_params backend_chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_chain_params));
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_top_n_sigma(n_sigma));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, backend_sampler_chain.get() }};
+
+    // n_seq_max = 2: the CPU reference below must run on the true raw model logits.
+    // llama_get_logits_ith() returns the backend-sampled logits for seq 0 (the sampled
+    // region takes precedence), so the reference is read from a second sequence that
+    // decodes the same prompt without a backend sampler.
+    test_context test_ctx(params, backend_sampler_configs, 2);
+
+    if (!test_ctx.decode({{ seq_id, "Hello" }, { raw_seq_id, "Hello" }})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    int32_t batch_idx     = test_ctx.idx_for_seq(seq_id);
+    int32_t raw_batch_idx = test_ctx.idx_for_seq(raw_seq_id);
+
+    const float * raw_logits     = llama_get_logits_ith(test_ctx.ctx.get(), raw_batch_idx);
+    float *       backend_logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx);
+    uint32_t      n_vocab        = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), batch_idx);
+
+    GGML_ASSERT(raw_logits != nullptr);
+    GGML_ASSERT(backend_logits != nullptr);
+    GGML_ASSERT(n_vocab == (uint32_t) test_ctx.n_vocab);
+
+    // CPU reference: masks in place, the array size does not change
+    llama_sampler_ptr cpu_sampler(llama_sampler_init_top_n_sigma(n_sigma));
+    std::vector<llama_token_data> cpu_data(n_vocab);
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        cpu_data[i] = { /* .id = */ (llama_token) i, /* .logit = */ raw_logits[i], /* .p = */ 0.0f };
+    }
+    llama_token_data_array cur_p = {
+        /* .data     = */ cpu_data.data(),
+        /* .size     = */ cpu_data.size(),
+        /* .selected = */ -1,
+        /* .sorted   = */ false,
+    };
+    llama_sampler_apply(cpu_sampler.get(), &cur_p);
+    GGML_ASSERT(cur_p.size == n_vocab);
+
+    // The same entries must be masked in both results; float rounding in mean/std can
+    // flip the "logit < max - n*std" boundary decision for a token or two (a wrong
+    // formula would differ by dozens), so count mismatches instead of asserting exactness.
+    size_t n_masked = 0;
+    size_t n_mismatched = 0;
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        const bool cpu_masked     = (cur_p.data[i].logit == -INFINITY);
+        const bool backend_masked = (backend_logits[i] == -INFINITY);
+
+        if (cpu_masked != backend_masked) {
+            n_mismatched++;
+        }
+
+        if (cpu_masked) {
+            n_masked++;
+        }
+
+        // unmasked entries must carry the original raw logit value
+        if (!backend_masked) {
+            GGML_ASSERT(std::fabs(backend_logits[i] - raw_logits[i]) < 1e-4f);
+        }
+    }
+
+    GGML_ASSERT(n_mismatched <= 2);
+    GGML_ASSERT(n_masked > 0);
+    GGML_ASSERT(n_masked < n_vocab);
+
+    // Sample using CPU sampler on top of the backend-modified logits
+    struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+
+    llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), batch_idx);
+    const std::string token_str = test_ctx.token_to_piece(token, false);
+    printf("top-n-sigma cpu sampled token id:%d, string: '%s'\n", token, token_str.c_str());
+    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+
+    for (int i = 0; i < 10; i++) {
+        int32_t loop_idx = test_ctx.idx_for_seq(seq_id);
+        llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), loop_idx);
+        printf("top-n-sigma gen step %d: token id :%5.d, string: %s\n", i, token, test_ctx.token_to_piece(token, false).c_str());
+        if (!test_ctx.decode_token(token, 0)) {
+            GGML_ASSERT(false && "Failed to decode token");
+        }
+    }
+
+    printf("top-n-sigma sampling test PASSED\n");
 }
 
 static void test_multi_sequence(const test_params & params) {
@@ -2201,6 +2318,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_top_p",                  test_top_p,                  true },
     { "test_min_p",                  test_min_p,                  true },
     { "test_typical",                test_typical,                true },
+    { "test_top_n_sigma",            test_top_n_sigma,            true },
     { "test_logit_bias",             test_logit_bias,             true },
     { "test_penalties",              test_penalties,              true },
     // multiple sequences

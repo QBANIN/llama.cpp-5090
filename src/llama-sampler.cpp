@@ -3347,12 +3347,18 @@ struct llama_sampler * llama_sampler_init_penalties(
 
 // top-n-sigma
 
-struct llama_sampler_top_n_sigma {
+struct llama_sampler_top_n_sigma : public llama_sampler_backend {
     const float n;
+
+    llama_sampler_top_n_sigma(float n)
+        : llama_sampler_backend("top-n-sigma")
+        , n (n) {
+    }
 };
 
-static const char * llama_sampler_top_n_sigma_name(const struct llama_sampler * /*smpl*/) {
-    return "top-n-sigma";
+static const char * llama_sampler_top_n_sigma_name(const struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_top_n_sigma *) smpl->ctx;
+    return sctx->get_name();
 }
 
 static void llama_sampler_top_n_sigma_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
@@ -3403,6 +3409,79 @@ static void llama_sampler_top_n_sigma_free(struct llama_sampler * smpl) {
     delete (llama_sampler_top_n_sigma *) smpl->ctx;
 }
 
+static bool llama_sampler_top_n_sigma_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    auto * sctx = (llama_sampler_top_n_sigma *) smpl->ctx;
+
+    GGML_UNUSED(n_outputs_max_per_seq);
+
+    const bool res = llama_sampler_backend_support(smpl, buft);
+
+    sctx->init(res);
+
+    return res;
+}
+
+static void llama_sampler_top_n_sigma_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    auto * sctx = (llama_sampler_top_n_sigma *) smpl->ctx;
+
+    GGML_UNUSED(gf);
+
+    // flatten
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+
+    // valid_mask = 1 for logits that are not -INFINITY (the CPU version skips them in mean/std)
+    struct ggml_tensor * valid_mask = ggml_step(ctx, ggml_add(ctx, logits, ggml_fill(ctx, logits, 1e30f)));
+
+    // replace -INF with a finite sentinel so that masked sums stay finite (-inf * 0 = NaN would poison mean/std)
+    struct ggml_tensor * logits_safe = ggml_clamp(ctx, logits, -1e30f, 1e30f);
+
+    // guard against division by zero when all logits are -INFINITY (CPU returns 0 then)
+    struct ggml_tensor * count      = ggml_sum(ctx, valid_mask);
+    struct ggml_tensor * count_safe = ggml_add(ctx, count, ggml_sub(ctx, ggml_fill(ctx, count, 1.0f), ggml_step(ctx, count)));
+
+    // mean of the valid logits
+    struct ggml_tensor * masked     = ggml_mul(ctx, logits_safe, valid_mask);
+    struct ggml_tensor * masked_sum = ggml_sum(ctx, masked);
+    struct ggml_tensor * mean       = ggml_div(ctx, masked_sum, count_safe);
+    ggml_set_name(mean, "top_n_sigma_mean");
+
+    // standard deviation of the valid logits
+    struct ggml_tensor * diff     = ggml_mul(ctx, valid_mask, ggml_sub(ctx, logits_safe, mean));
+    struct ggml_tensor * diff_sq  = ggml_mul(ctx, diff, diff);
+    struct ggml_tensor * diff_sum = ggml_sum(ctx, diff_sq);
+    struct ggml_tensor * var      = ggml_div(ctx, diff_sum, count_safe);
+    struct ggml_tensor * std_dev  = ggml_sqrt(ctx, var);
+    ggml_set_name(std_dev, "top_n_sigma_std");
+
+    // max logit of the valid entries
+    struct ggml_tensor * max_idx   = ggml_argmax(ctx, logits);
+    struct ggml_tensor * max_row   = ggml_get_rows(ctx, ggml_reshape_2d(ctx, logits, 1, logits->ne[0]), max_idx);
+    struct ggml_tensor * max_logit = ggml_reshape_1d(ctx, max_row, 1);
+    ggml_set_name(max_logit, "top_n_sigma_max");
+
+    // threshold: max - n * std
+    struct ggml_tensor * threshold = ggml_sub(ctx, max_logit, ggml_scale(ctx, std_dev, sctx->n));
+    ggml_set_name(threshold, "top_n_sigma_threshold");
+
+    // keep entries with logit >= threshold (strict < is masked on the CPU version)
+    struct ggml_tensor * below = ggml_step(ctx, ggml_scale(ctx, ggml_sub(ctx, logits, threshold), -1.0f));
+    struct ggml_tensor * keep  = ggml_sub(ctx, ggml_fill(ctx, below, 1.0f), below);
+
+    // bias is -INF for valid entries below the threshold, 0 otherwise
+    struct ggml_tensor * bad  = ggml_mul(ctx, valid_mask, ggml_sub(ctx, ggml_fill(ctx, valid_mask, 1.0f), keep));
+    struct ggml_tensor * bias = ggml_log(ctx, ggml_sub(ctx, ggml_fill(ctx, bad, 1.0f), bad));
+
+    data->logits = ggml_add(ctx, logits, bias);
+    ggml_set_name(data->logits, "top_n_sigma_logits");
+}
+
 static struct llama_sampler_i llama_sampler_top_n_sigma_i = {
     /* .name              = */ llama_sampler_top_n_sigma_name,
     /* .accept            = */ nullptr,
@@ -3410,12 +3489,12 @@ static struct llama_sampler_i llama_sampler_top_n_sigma_i = {
     /* .reset             = */ nullptr,
     /* .clone             = */ llama_sampler_top_n_sigma_clone,
     /* .free              = */ llama_sampler_top_n_sigma_free,
-    /* .backend_init      = */ nullptr,
+    /* .backend_init      = */ llama_sampler_top_n_sigma_backend_init,
     /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_top_n_sigma_backend_apply,
     /* .backend_set_input = */ nullptr,
     /* .backend_reset     = */ nullptr,
-    /* .copy_state        = */ nullptr,
+    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_top_n_sigma>,
 };
 
 struct llama_sampler * llama_sampler_init_top_n_sigma(float n) {
@@ -3427,9 +3506,8 @@ struct llama_sampler * llama_sampler_init_top_n_sigma(float n) {
 
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_top_n_sigma_i,
-        /* .ctx   = */ new llama_sampler_top_n_sigma {
-            /* .n = */ n,
-        }
+        /* .ctx   = */ new llama_sampler_top_n_sigma(
+            n)
     );
 }
 

@@ -2447,7 +2447,7 @@ struct llama_sampler * llama_sampler_init_temp_ext(float temp, float delta, floa
 
 // xtc
 
-struct llama_sampler_xtc {
+struct llama_sampler_xtc : public llama_sampler_backend {
     const float    probability;
     const float    threshold;
     const size_t   min_keep;
@@ -2456,10 +2456,28 @@ struct llama_sampler_xtc {
     uint32_t       seed_cur;
 
     std::mt19937   rng;
+
+    std::vector<ggml_tensor *> inp_uniforms;
+
+    llama_sampler_xtc(float probability, float threshold, size_t min_keep, uint32_t seed)
+        : llama_sampler_backend("xtc")
+        , probability (probability)
+        , threshold   (threshold)
+        , min_keep    (min_keep)
+        , seed        (seed)
+        , seed_cur    (get_rng_seed(seed))
+        , rng         (seed_cur) {
+    }
+    void copy_state(const llama_sampler_xtc & src) {
+        // note: inp_uniforms belongs to the current sampling graph
+        seed_cur = src.seed_cur;
+        rng      = src.rng;
+    }
 };
 
-static const char * llama_sampler_xtc_name(const struct llama_sampler * /*smpl*/) {
-    return "xtc";
+static const char * llama_sampler_xtc_name(const struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_xtc *) smpl->ctx;
+    return sctx->get_name();
 }
 
 static void llama_sample_xtc_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
@@ -2513,6 +2531,115 @@ static void llama_sampler_xtc_free(struct llama_sampler * smpl) {
     delete (llama_sampler_xtc *) smpl->ctx;
 }
 
+static bool llama_sampler_xtc_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    auto * sctx = (llama_sampler_xtc *) smpl->ctx;
+
+    if (n_outputs_max_per_seq > 1) {
+        sctx->init(false);
+        return false;
+    }
+
+    const bool res = llama_sampler_backend_support(smpl, buft);
+
+    sctx->init(res);
+
+    return res;
+}
+
+static void llama_sampler_xtc_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    auto * sctx = (llama_sampler_xtc *) smpl->ctx;
+
+    GGML_UNUSED(gf);
+
+    // uniform random input in [0, 1), filled by backend_set_input
+    ggml_tensor * inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_format_name(inp_uniform, "xtc_uniform_%zu", sctx->inp_uniforms.size());
+    ggml_set_input(inp_uniform);
+    sctx->inp_uniforms.push_back(inp_uniform);
+
+    // flatten
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+
+    auto ggml_sort = [ctx](struct ggml_tensor * a, struct ggml_tensor * b) {
+        GGML_ASSERT(ggml_nrows(a) == 1);
+        struct ggml_tensor * a_reshaped = ggml_reshape_2d(ctx, a, 1, a->ne[0]);
+        struct ggml_tensor * a_sorted   = ggml_get_rows(ctx, a_reshaped, b);
+        return ggml_reshape_1d(ctx, a_sorted, ggml_nelements(a_sorted));
+    };
+
+    auto ge = [ctx](struct ggml_tensor * a, struct ggml_tensor * b) {
+        return ggml_sub(ctx, ggml_fill(ctx, a, 1.0f), ggml_step(ctx, ggml_sub(ctx, b, a)));
+    };
+
+    // softmax, sorted in descending probability
+    struct ggml_tensor * probs         = ggml_soft_max(ctx, logits);
+    struct ggml_tensor * sorted_idx    = ggml_argsort(ctx, probs, GGML_SORT_ORDER_DESC);
+    struct ggml_tensor * sorted_logits = ggml_sort(logits, sorted_idx);
+    struct ggml_tensor * sorted_probs  = ggml_sort(probs, sorted_idx);
+
+    // count = number of entries with p >= threshold (contiguous at the start in sorted order)
+    struct ggml_tensor * above = ge(sorted_probs, ggml_fill(ctx, sorted_probs, sctx->threshold));
+    struct ggml_tensor * count = ggml_sum(ctx, above);
+
+    // static switch: apply the cutoff only when uniform <= probability
+    // (the CPU version returns early when chance > probability)
+    struct ggml_tensor * apply_switch = ge(ggml_fill(ctx, inp_uniform, sctx->probability), inp_uniform);
+
+    // the cutoff applies only when the tail keeps at least min_keep entries and count > 1
+    struct ggml_tensor * n          = ggml_fill(ctx, count, (float) sorted_probs->ne[0]);
+    struct ggml_tensor * tail_size  = ggml_sub(ctx, n, ggml_sub(ctx, count, ggml_fill(ctx, count, 1.0f)));
+    struct ggml_tensor * cond_keep  = ge(tail_size, ggml_fill(ctx, count, (float) sctx->min_keep));
+    struct ggml_tensor * cond_count = ge(count, ggml_fill(ctx, count, 2.0f));
+    struct ggml_tensor * cutoff_ok  = ggml_mul(ctx, cond_keep, cond_count);
+
+    // drop ranks 0 .. count-2 (the highest-probability entries except the last one)
+    struct ggml_tensor * rank      = ggml_arange(ctx, 0.0f, (float) sorted_probs->ne[0], 1.0f);
+    struct ggml_tensor * count_n   = ggml_repeat(ctx, count, rank);
+    struct ggml_tensor * drop_rank = ggml_step(ctx, ggml_sub(ctx, ggml_sub(ctx, count_n, ggml_fill(ctx, rank, 1.0f)), rank));
+
+    struct ggml_tensor * drop = ggml_mul(ctx, drop_rank, ggml_mul(ctx, apply_switch, cutoff_ok));
+    struct ggml_tensor * keep = ggml_sub(ctx, ggml_fill(ctx, drop, 1.0f), drop);
+
+    struct ggml_tensor * bias = ggml_log(ctx, keep);
+    data->logits = ggml_add(ctx, sorted_logits, bias);
+
+    if (data->candidates != nullptr) {
+        struct ggml_tensor * candidates = ggml_reshape_1d(ctx, data->candidates, ggml_nelements(data->candidates));
+        data->candidates = ggml_sort(candidates, sorted_idx);
+    } else {
+        data->candidates = sorted_idx;
+    }
+}
+
+static void llama_sampler_xtc_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_xtc *) smpl->ctx;
+
+    GGML_ASSERT(!sctx->inp_uniforms.empty());
+
+    // use the same float distribution as the CPU version so that with the same seed
+    // the sequence of random values is identical
+    std::uniform_real_distribution<float> distribution(0.0f, 1.0f);
+
+    for (auto * inp_uniform : sctx->inp_uniforms) {
+        GGML_ASSERT(inp_uniform != nullptr);
+
+        const float rnd = distribution(sctx->rng);
+        ggml_backend_tensor_set(inp_uniform, &rnd, 0, sizeof(float));
+    }
+}
+
+static void llama_sampler_xtc_backend_reset(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_xtc *) smpl->ctx;
+    sctx->inp_uniforms.clear();
+}
+
 static void llama_sampler_xtc_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_xtc *) smpl->ctx;
     ctx->seed_cur = get_rng_seed(ctx->seed);
@@ -2526,12 +2653,12 @@ static struct llama_sampler_i llama_sampler_xtc_i = {
     /* .reset             = */ llama_sampler_xtc_reset,
     /* .clone             = */ llama_sampler_xtc_clone,
     /* .free              = */ llama_sampler_xtc_free,
-    /* .backend_init      = */ nullptr,
+    /* .backend_init      = */ llama_sampler_xtc_backend_init,
     /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
-    /* .backend_set_input = */ nullptr,
-    /* .backend_reset     = */ nullptr,
-    /* .copy_state        = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_xtc_backend_apply,
+    /* .backend_set_input = */ llama_sampler_xtc_backend_set_input,
+    /* .backend_reset     = */ llama_sampler_xtc_backend_reset,
+    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_xtc>,
 };
 
 struct llama_sampler * llama_sampler_init_xtc(float p, float t, size_t min_keep, uint32_t seed) {
@@ -2541,18 +2668,13 @@ struct llama_sampler * llama_sampler_init_xtc(float p, float t, size_t min_keep,
         return llama_sampler_init_empty("?xtc");
     }
 
-    const auto seed_cur = get_rng_seed(seed);
-
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_xtc_i,
-        /* .ctx   = */ new llama_sampler_xtc {
-            /* .probability   = */ p,
-            /* .threshold     = */ t,
-            /* .min_keep      = */ min_keep,
-            /* .seed          = */ seed,
-            /* .seed_cur      = */ seed_cur,
-            /* .rng           = */ std::mt19937(seed_cur),
-        }
+        /* .ctx   = */ new llama_sampler_xtc(
+            p,
+            t,
+            min_keep,
+            seed)
     );
 }
 

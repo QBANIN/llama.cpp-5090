@@ -977,6 +977,110 @@ static void test_top_n_sigma(const test_params & params) {
     printf("top-n-sigma sampling test PASSED\n");
 }
 
+static void test_xtc(const test_params & params) {
+    const int seq_id     = 0;
+    const int raw_seq_id = 1;   // no backend sampler: its llama_get_logits_ith() returns the raw model logits
+    const float  probability = 1.0f; // always apply the cutoff (CPU never takes the early-return path)
+    const float  threshold   = 0.1f;
+    const size_t min_keep    = 2;
+    const uint32_t seed      = 42;
+
+    struct llama_sampler_chain_params backend_chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_chain_params));
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_xtc(probability, threshold, min_keep, seed));
+    std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, backend_sampler_chain.get() }};
+
+    // n_seq_max = 2: the CPU reference below must run on the true raw model logits.
+    // llama_get_logits_ith() returns the backend-sampled logits for seq 0 (the sampled
+    // region takes precedence), so the reference is read from a second sequence that
+    // decodes the same prompt without a backend sampler.
+    test_context test_ctx(params, backend_sampler_configs, 2);
+
+    if (!test_ctx.decode({{ seq_id, "Hello" }, { raw_seq_id, "Hello" }})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    int32_t batch_idx     = test_ctx.idx_for_seq(seq_id);
+    int32_t raw_batch_idx = test_ctx.idx_for_seq(raw_seq_id);
+
+    const float * raw_logits     = llama_get_logits_ith(test_ctx.ctx.get(), raw_batch_idx);
+    float *       backend_logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx);
+    uint32_t      n_vocab        = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), batch_idx);
+
+    GGML_ASSERT(raw_logits != nullptr);
+    GGML_ASSERT(backend_logits != nullptr);
+    GGML_ASSERT(n_vocab == (uint32_t) test_ctx.n_vocab);
+
+    // CPU reference: with probability = 1.0 the cutoff is always applied and is deterministic.
+    // It sorts by probability and drops all but the last of the entries with p >= threshold.
+    llama_sampler_ptr cpu_sampler(llama_sampler_init_xtc(probability, threshold, min_keep, seed));
+    std::vector<llama_token_data> cpu_kept = apply_cpu_sampler_to_logits(cpu_sampler.get(), raw_logits, n_vocab);
+
+    GGML_ASSERT(cpu_kept.size() > 0);
+    GGML_ASSERT(cpu_kept.size() < n_vocab);
+
+    // The backend output is in sorted order; candidates map position -> original token id.
+    // The backend result must keep exactly the same set of tokens, with unchanged logits.
+    const llama_token * candidates    = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), batch_idx);
+    uint32_t n_candidates             = llama_get_sampled_candidates_count_ith(test_ctx.ctx.get(), batch_idx);
+    GGML_ASSERT(candidates != nullptr);
+    GGML_ASSERT(n_candidates == n_vocab);
+
+
+    size_t n_kept_backend = 0;
+    for (uint32_t i = 0; i < n_candidates; ++i) {
+        if (backend_logits[i] > -1e30f) n_kept_backend++;
+    }
+    // The kept sets must match; float rounding in the softmax can flip the "p >= threshold"
+    // decision for a token or two (a wrong formula would differ by dozens). Count the
+    // symmetric difference instead of requiring exactness.
+    std::unordered_set<llama_token> cpu_kept_set;
+    for (const auto & td : cpu_kept) cpu_kept_set.insert(td.id);
+    std::unordered_set<llama_token> backend_kept_set;
+    for (uint32_t i = 0; i < n_candidates; ++i) {
+        if (backend_logits[i] > -1e30f) backend_kept_set.insert(candidates[i]);
+    }
+
+    size_t n_sym_diff = 0;
+    for (llama_token id : cpu_kept_set) {
+        if (backend_kept_set.find(id) == backend_kept_set.end()) n_sym_diff++;
+    }
+    for (llama_token id : backend_kept_set) {
+        if (cpu_kept_set.find(id) == cpu_kept_set.end()) n_sym_diff++;
+    }
+    GGML_ASSERT(n_sym_diff <= 2);
+    GGML_ASSERT(n_kept_backend > 0);
+    GGML_ASSERT(n_kept_backend < n_vocab);
+
+    // kept tokens must carry their original raw logit values in the backend output
+    for (uint32_t i = 0; i < n_candidates; ++i) {
+        if (backend_logits[i] > -1e30f) {
+            GGML_ASSERT(std::fabs(backend_logits[i] - raw_logits[candidates[i]]) < 1e-4f);
+        }
+    }
+
+    // Sample using CPU sampler on top of the backend-modified logits
+    struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+
+    llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), batch_idx);
+    const std::string token_str = test_ctx.token_to_piece(token, false);
+    printf("xtc cpu sampled token id:%d, string: '%s'\n", token, token_str.c_str());
+    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+
+    for (int i = 0; i < 10; i++) {
+        int32_t loop_idx = test_ctx.idx_for_seq(seq_id);
+        llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), loop_idx);
+        printf("xtc gen step %d: token id :%5.d, string: %s\n", i, token, test_ctx.token_to_piece(token, false).c_str());
+        if (!test_ctx.decode_token(token, 0)) {
+            GGML_ASSERT(false && "Failed to decode token");
+        }
+    }
+
+    printf("xtc sampling test PASSED\n");
+}
+
 static void test_multi_sequence(const test_params & params) {
     struct llama_sampler_chain_params chain_params_0 = llama_sampler_chain_default_params();
     llama_sampler_ptr sampler_chain_0(llama_sampler_chain_init(chain_params_0));
@@ -2319,6 +2423,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_min_p",                  test_min_p,                  true },
     { "test_typical",                test_typical,                true },
     { "test_top_n_sigma",            test_top_n_sigma,            true },
+    { "test_xtc",                    test_xtc,                    true },
     { "test_logit_bias",             test_logit_bias,             true },
     { "test_penalties",              test_penalties,              true },
     // multiple sequences

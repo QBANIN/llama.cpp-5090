@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "../src/llama-sampler.h"
 
 #include "ggml.h"
 
@@ -155,10 +156,14 @@ struct common_sampler {
             }
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
-            GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            if (logits == nullptr) {
+                // token-only backend sampling: only the sampled token is available on the host
+                cur.clear();
+            } else {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
@@ -429,6 +434,11 @@ struct common_sampler * common_sampler_init(
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
 
         params.backend_sampling = false;
+    }
+
+    // token-only mode: only the sampled token is copied back to the host (no probs/logits/candidates)
+    if (params.backend_sampling && params.n_probs == 0) {
+        llama_sampler_chain_set_token_only(chain, true);
     }
 
     auto * result = new common_sampler {

@@ -3,6 +3,7 @@
 #include "llama-cpp.h"
 #include "common.h"
 #include "sampling.h"
+#include "../src/llama-sampler.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -352,6 +353,66 @@ static void test_greedy(const test_params & params) {
     }
 }
 
+
+static void test_token_only(const test_params & params) {
+    const int seq_id = 0;
+    const int32_t seed = 88;
+    const int n_gen = 10;
+
+    auto run_generation = [&](bool token_only) -> std::vector<llama_token> {
+        struct llama_sampler_chain_params backend_sampler_params = llama_sampler_chain_default_params();
+        llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_sampler_params));
+
+        llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_dist(seed));
+
+        if (token_only) {
+            llama_sampler_chain_set_token_only(backend_sampler_chain.get(), true);
+        }
+
+        std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, backend_sampler_chain.get() }};
+
+        test_context test_ctx(params, backend_sampler_configs);
+
+        if (!test_ctx.decode({{seq_id, "Some"}})) {
+            GGML_ASSERT(false && "Failed to decode token");
+        }
+
+        std::vector<llama_token> tokens;
+        for (int i = 0; i < n_gen; i++) {
+            int32_t batch_idx = test_ctx.idx_for_seq(seq_id);
+            llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
+            GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+            tokens.push_back(token);
+
+            if (token_only) {
+                // in token-only mode only the sampled token is published
+                GGML_ASSERT(llama_get_sampled_probs_ith(test_ctx.ctx.get(), batch_idx) == nullptr);
+                GGML_ASSERT(llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx) == nullptr);
+            } else {
+                // full mode publishes the probs (dist) and the narrowed candidates' logits
+                GGML_ASSERT(llama_get_sampled_probs_ith(test_ctx.ctx.get(), batch_idx) != nullptr);
+            }
+
+            if (!test_ctx.decode_token(token, seq_id)) {
+                GGML_ASSERT(false && "Failed to decode token");
+            }
+        }
+
+        return tokens;
+    };
+
+    auto full_tokens = run_generation(false);
+    auto only_tokens = run_generation(true);
+
+    GGML_ASSERT(full_tokens == only_tokens);
+
+    for (size_t i = 0; i < full_tokens.size(); i++) {
+        printf("token-only step %zu: id:%d\n", i, full_tokens[i]);
+    }
+
+    printf("token-only generated %zu tokens identical to full mode\n", full_tokens.size());
+}
 
 static void test_greedy_filtered_common(const test_params & params) {
     auto check = [&](common_params_sampling sp, bool greedy) {
@@ -2072,6 +2133,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_greedy",                 test_greedy,                 true },
     { "test_greedy_filtered",        test_greedy_filtered,        true },
     { "test_greedy_filtered_common", test_greedy_filtered_common, true },
+    { "test_token_only",             test_token_only,             true },
     { "test_temp",                   test_temp,                   true },
     { "test_temp_ext",               test_temp_ext,               true },
     { "test_top_k",                  test_top_k,                  true },

@@ -132,6 +132,7 @@ struct llama_context {
     bool set_embeddings_nextn_dev(bool value);
     bool get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out);
     bool set_h_nextn_rows(int64_t row0, int64_t n_rows, const float * data);
+    bool copy_h_nextn_rows(int64_t row_dst, int64_t row_src, int64_t n_rows);
 
     // state rows read from the h_nextn device buffer of src, see llama_set_embd_state_src()
     bool set_state_src(llama_context * src);

@@ -1729,6 +1729,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // keep the pending row on the device: the last h row of the verify batch (the row
+        // process() used to fetch to the host) is copied to the pending row. done for both the
+        // catch-up decode (below) and the draft first token, which read it as a state row
+        if (dev_rows) {
+            GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    llama_copy_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, i_batch_end[seq_id], 1);
+                }
+            }
+            // the chain heads track the pending row on the host
+            if (chain_heads) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0) {
+                        llama_get_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+                    }
+                }
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -1739,14 +1759,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            if (dev_rows) {
-                GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
-                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                    if (i_batch_beg[seq_id] >= 0) {
-                        llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
-                    }
-                }
-            }
 
             const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
@@ -1825,9 +1837,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = h_rows;
 
             if (dev_rows) {
-                // the rows stay on the device until the next target decode, only the pending row comes to the host
+                // the rows stay on the device until the next target decode, and the pending row
+                // stays on the device too (the D2D copy above moved it), so nothing comes to the host
                 verify_row0[seq_id] = h_offset;
-                llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data());
                 continue;
             }
 
@@ -1879,7 +1891,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+            if (dev_rows) {
+                // the pending row stays on the device, read it as a state row
+                batch.set_embd_state_row(idx, n_batch_tgt + seq_id);
+            } else {
+                batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+            }
 
             i_last[seq_id] = idx;
 
@@ -2023,9 +2040,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         if (dev_rows) {
-            // process() already fetched the last row
+            // keep the pending row on the device: the accepted row is copied to the pending row
+            // (when the last row was accepted, process() already copied it)
             if (i_h != n_rows - 1) {
-                llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h, 1, pending_h[seq_id].data());
+                llama_copy_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt + seq_id, verify_row0[seq_id] + i_h, 1);
+            }
+            if (chain_heads) {
+                // the chain heads track the pending row on the host
+                llama_get_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
             }
             return;
         }
@@ -2040,7 +2062,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         data.resize(row_bytes);
-        std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
+        if (dev_rows) {
+            // the pending row lives on the device, fetch it on demand
+            if (!llama_get_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt + seq_id, 1, (float *) data.data())) {
+                return false;
+            }
+        } else {
+            std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
+        }
         return true;
     }
 
@@ -2054,6 +2083,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
+        if (dev_rows) {
+            // upload the pending row to the device
+            llama_set_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+        }
     }
 };
 

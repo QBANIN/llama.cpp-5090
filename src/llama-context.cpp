@@ -1654,6 +1654,38 @@ bool llama_context::set_h_nextn_rows(int64_t row0, int64_t n_rows, const float *
     return true;
 }
 
+bool llama_context::copy_h_nextn_rows(int64_t row_dst, int64_t row_src, int64_t n_rows) {
+    if (h_nextn_dev == nullptr || row_dst < 0 || row_src < 0 || n_rows < 0 ||
+        row_dst + n_rows > h_nextn_dev->ne[1] || row_src + n_rows > h_nextn_dev->ne[1]) {
+        return false;
+    }
+
+    // the source rows were written by the last decode
+    if (ev_h_nextn_written_recorded) {
+        ggml_backend_event_synchronize(ev_h_nextn_written.get());
+    } else {
+        synchronize();
+    }
+    // a reader may still read the destination rows
+    if (ev_h_nextn_read_recorded) {
+        ggml_backend_event_synchronize(ev_h_nextn_read.get());
+    }
+
+    const int64_t ne0 = h_nextn_dev->ne[0];
+    const size_t  nb1 = h_nextn_dev->nb[1];
+
+    ggml_tensor * t_src = ggml_view_2d(ctx_h_nextn_dev.get(), h_nextn_dev, ne0, n_rows, nb1, row_src * nb1);
+    ggml_tensor * t_dst = ggml_view_2d(ctx_h_nextn_dev.get(), h_nextn_dev, ne0, n_rows, nb1, row_dst * nb1);
+
+    ggml_backend_tensor_copy_async(h_nextn_backend, h_nextn_backend, t_src, t_dst);
+
+    // ordered after the copy, so the next reader of the destination rows waits for it
+    ggml_backend_event_record(ev_h_nextn_written.get(), h_nextn_backend);
+    ev_h_nextn_written_recorded = true;
+
+    return true;
+}
+
 bool llama_context::set_state_src(llama_context * src) {
     if (cparams.ctx_state_src != src) {
         sched_need_reserve = true;
@@ -4824,6 +4856,10 @@ bool llama_get_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t 
 
 bool llama_set_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t n_rows, const float * data) {
     return ctx->set_h_nextn_rows(row0, n_rows, data);
+}
+
+bool llama_copy_embeddings_nextn_rows(llama_context * ctx, int64_t row_dst, int64_t row_src, int64_t n_rows) {
+    return ctx->copy_h_nextn_rows(row_dst, row_src, n_rows);
 }
 
 bool llama_set_embd_state_src(llama_context * ctx, llama_context * src) {

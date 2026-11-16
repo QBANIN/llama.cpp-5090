@@ -4534,6 +4534,7 @@ void llm_graph_context::build_sampling() const {
     // whatever rows the ubatch outputs: a chain without a row works on the first row and is not selected
     for (const auto & [seq_id, sampler] : samplers) {
         const auto it = sampling_rows.find(seq_id);
+        const bool token_only = llama_sampler_chain_is_token_only(sampler);
         const auto & rows = it != sampling_rows.end() ? it->second : no_rows;
 
         for (uint32_t i = 0; i < cparams.n_outputs_max_per_seq; ++i) {
@@ -4555,9 +4556,9 @@ void llm_graph_context::build_sampling() const {
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
             if (data.sampled     != nullptr) { res->t_sampling_all.push_back(data.sampled);     }
-            if (data.probs       != nullptr) { res->t_sampling_all.push_back(data.probs);       }
-            if (data.logits      != nullptr) { res->t_sampling_all.push_back(data.logits);      }
-            if (data.candidates  != nullptr) { res->t_sampling_all.push_back(data.candidates);  }
+            if (!token_only && data.probs       != nullptr) { res->t_sampling_all.push_back(data.probs);       }
+            if (!token_only && data.logits      != nullptr) { res->t_sampling_all.push_back(data.logits);      }
+            if (!token_only && data.candidates  != nullptr) { res->t_sampling_all.push_back(data.candidates);  }
 
             if (data.sampled != nullptr) {
                 if (active) {
@@ -4567,7 +4568,7 @@ void llm_graph_context::build_sampling() const {
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
-            if (data.probs != nullptr) {
+            if (!token_only && data.probs != nullptr) {
                 if (active) {
                     res->t_sampled_probs[row] = data.probs;
                 }
@@ -4575,7 +4576,7 @@ void llm_graph_context::build_sampling() const {
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
-            if (data.logits != nullptr) {
+            if (!token_only && data.logits != nullptr) {
                 if (active) {
                     res->t_sampled_logits[row] = data.logits;
                 }
@@ -4583,7 +4584,7 @@ void llm_graph_context::build_sampling() const {
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
-            if (data.candidates != nullptr) {
+            if (!token_only && data.candidates != nullptr) {
                 if (active) {
                     res->t_candidates[row] = data.candidates;
                 }

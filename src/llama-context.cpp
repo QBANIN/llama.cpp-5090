@@ -1137,6 +1137,14 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+
+        // the raw logits buffer is only filled when some sequence in the batch needs them;
+        // with backend sampling (token-only mode) it is never copied, so the data is stale
+        if (!logits_valid) {
+            LLAMA_LOG_WARN("%s: logits are not available for id %d (backend sampling without raw logits)\n", __func__, i);
+            return nullptr;
+        }
+
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -1987,6 +1995,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    logits_valid = false;
     auto * t_logits  = res->get_logits();
     auto * t_embd    = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
     auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
@@ -1998,6 +2007,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(logits.data != nullptr);
 
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_outputs*n_vocab*sizeof(float));
+        logits_valid = true;
     }
 
     // extract embeddings
@@ -2317,6 +2327,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    logits_valid = false;
 
     // ordering for the layer input device buffer
     llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
@@ -2432,6 +2443,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
+                logits_valid = true;
         }
 
         // extract embeddings

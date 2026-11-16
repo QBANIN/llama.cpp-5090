@@ -37,6 +37,9 @@ struct llama_sampler_chain {
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
+// token-only mode: only the sampled token is published as a graph output (no probs/logits/candidates)
+bool llama_sampler_chain_is_token_only(const struct llama_sampler * sampler);
+void llama_sampler_chain_set_token_only(struct llama_sampler * sampler, bool token_only);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

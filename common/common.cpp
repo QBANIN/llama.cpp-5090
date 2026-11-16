@@ -6,6 +6,7 @@
 #include "common.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-sampler.h"
 
 #include "fit.h"
 #include "log.h"
@@ -1376,6 +1377,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
         pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
+    }
+
+    // rejection sampling needs the full distribution (probs + candidates) on the host
+    if (params.speculative.draft.probabilistic) {
+        for (auto & smpl : pimpl->samplers) {
+            llama_sampler_chain_set_token_only(common_sampler_get(smpl.get()), false);
+        }
     }
 
     if (params.sampling.backend_sampling) {

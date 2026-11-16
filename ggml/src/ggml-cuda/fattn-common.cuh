@@ -51,6 +51,12 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+// The MMA kernel reads F8_E4M3 K/V natively (in-tile dequant), so no F16 scratch buffer is needed
+// when both K and V are F8. Other K/V types are still converted to F16 before the kernel.
+static inline bool ggml_cuda_fattn_mma_f16_reads_f8_natively(const ggml_tensor * K, const ggml_tensor * V) {
+    return K->type == GGML_TYPE_F8_E4M3 && V->type == GGML_TYPE_F8_E4M3;
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);

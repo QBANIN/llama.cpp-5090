@@ -797,10 +797,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            // F8 K/V is read natively by the MMA kernel (in-tile dequant), no F16 scratch buffer needed:
+            const bool native_f8 = ggml_cuda_fattn_mma_f16_reads_f8_natively(K, V);
+            need_f16_K = !native_f8;
+            need_f16_V = !native_f8;
+            break;
+        }
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;

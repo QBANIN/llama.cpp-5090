@@ -1,0 +1,233 @@
+name: Docker (RTX 5090)
+
+# Builds .devops/cuda-5090.Dockerfile and publishes it to ghcr.io/<owner>/llama.cpp-5090.
+# The GPU host never compiles: it pulls the image by tag (see deploy/5090/README.md).
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      build_profiling:
+        description: "Also build and push the profiling image (nsys + ncu, heavy)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CUDA_VERSION: 13.5.0
+  CUDA_DOCKER_ARCH: 120a-real
+  DOCKERFILE: .devops/cuda-5090.Dockerfile
+
+jobs:
+  build:
+    name: Build and push
+    # PRs from external forks have no packages:write and must not publish images
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Check out the repo
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          # full history: the build number is the commit count
+          fetch-depth: 0
+
+      - name: Determine image metadata
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO_LC="${GITHUB_REPOSITORY@L}"
+          echo "name=ghcr.io/${REPO_LC}" >> "$GITHUB_OUTPUT"
+          echo "build_number=b$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" || ( "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${BUILD_PROFILING}" == "true" ) ]]; then
+            echo "profiling=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "profiling=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          BUILD_PROFILING: ${{ inputs.build_profiling }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # tags: master, sha-<short>, pr-<nr>, latest (default branch only)
+      - name: Runtime image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=llama.cpp-5090
+            org.opencontainers.image.description=llama.cpp for NVIDIA RTX 5090 (CUDA ${{ env.CUDA_VERSION }}, ${{ env.CUDA_DOCKER_ARCH }})
+            org.opencontainers.image.version=${{ steps.image.outputs.build_number }}
+            com.nvidia.cuda.version=${{ env.CUDA_VERSION }}
+            org.ggml.cuda.architectures=${{ env.CUDA_DOCKER_ARCH }}
+
+      - name: Build runtime image (local, for smoke test)
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          target: runtime
+          platforms: linux/amd64
+          load: true
+          tags: llama-5090:smoke
+          build-args: |
+            CUDA_VERSION=${{ env.CUDA_VERSION }}
+            CUDA_DOCKER_ARCH=${{ env.CUDA_DOCKER_ARCH }}
+            BUILD_DATE=${{ steps.image.outputs.build_date }}
+            APP_VERSION=${{ steps.image.outputs.build_number }}
+            APP_REVISION=${{ github.sha }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=registry,ref=${{ steps.image.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max
+
+      # No GPU on the runner: only check that the binaries start and that no shared library is missing.
+      # libcuda.so.1 comes from the host driver via the NVIDIA Container Toolkit, so it is expected to be absent here.
+      - name: Smoke test (no GPU)
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG=llama-5090:smoke
+          docker run --rm "$IMG" ls -la /app
+          for bin in llama-server llama-cli llama-bench llama-perplexity test-backend-ops llama-quantize llama-batched-bench llama-tokenize; do
+            docker run --rm "$IMG" test -x "/app/$bin" || { echo "missing /app/$bin"; exit 1; }
+          done
+          docker run --rm "$IMG" llama-server --version
+          docker run --rm "$IMG" llama-cli --version
+          docker run --rm "$IMG" llama-perplexity --version
+          docker run --rm "$IMG" llama-bench --help > /dev/null
+          # no "| head": with pipefail an early-closed pipe fails the step (SIGPIPE on the writer)
+          n_ops=$(docker run --rm "$IMG" test-backend-ops --list-ops | wc -l)
+          echo "test-backend-ops --list-ops: $n_ops ops"
+          test "$n_ops" -gt 50
+          docker run --rm "$IMG" id
+          docker run --rm "$IMG" bash -c '
+            set -e
+            for f in /app/llama-server /app/llama-cli /app/llama-bench /app/llama-perplexity /app/test-backend-ops /app/libggml-cuda.so /app/libggml-cpu-*.so; do
+              missing="$(ldd "$f" | grep "not found" | grep -v "libcuda.so.1" || true)"
+              if [[ -n "$missing" ]]; then echo "$f: $missing"; exit 1; fi
+            done
+            echo "ldd: no missing libraries (except libcuda.so.1 from the host driver)"
+          '
+          docker image inspect "$IMG" --format '{{ json .Config.Labels }}'
+
+      - name: Push runtime image
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CUDA_VERSION=${{ env.CUDA_VERSION }}
+            CUDA_DOCKER_ARCH=${{ env.CUDA_DOCKER_ARCH }}
+            BUILD_DATE=${{ steps.image.outputs.build_date }}
+            APP_VERSION=${{ steps.image.outputs.build_number }}
+            APP_REVISION=${{ github.sha }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=registry,ref=${{ steps.image.outputs.name }}:buildcache
+
+      - name: Profiling image tags and labels
+        if: ${{ steps.image.outputs.profiling == 'true' }}
+        id: meta_profiling
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: |
+            suffix=-profiling,onlatest=true
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=llama.cpp-5090-profiling
+            org.opencontainers.image.description=llama.cpp for NVIDIA RTX 5090 (CUDA ${{ env.CUDA_VERSION }}, ${{ env.CUDA_DOCKER_ARCH }}) + Nsight Systems/Compute
+            org.opencontainers.image.version=${{ steps.image.outputs.build_number }}
+            com.nvidia.cuda.version=${{ env.CUDA_VERSION }}
+            org.ggml.cuda.architectures=${{ env.CUDA_DOCKER_ARCH }}
+
+      # nsys/ncu are checked with --version inside the Dockerfile; the build stage is reused from the local cache.
+      - name: Build and push profiling image
+        if: ${{ steps.image.outputs.profiling == 'true' }}
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          target: profiling
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta_profiling.outputs.tags }}
+          labels: ${{ steps.meta_profiling.outputs.labels }}
+          build-args: |
+            CUDA_VERSION=${{ env.CUDA_VERSION }}
+            CUDA_DOCKER_ARCH=${{ env.CUDA_DOCKER_ARCH }}
+            BUILD_DATE=${{ steps.image.outputs.build_date }}
+            APP_VERSION=${{ steps.image.outputs.build_number }}
+            APP_REVISION=${{ github.sha }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: |
+            type=registry,ref=${{ steps.image.outputs.name }}:buildcache
+            type=registry,ref=${{ steps.image.outputs.name }}:buildcache-profiling
+          cache-to: type=registry,ref=${{ steps.image.outputs.name }}:buildcache-profiling,mode=max
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## llama.cpp-5090 image"
+            echo
+            echo "CUDA ${CUDA_VERSION}, arch ${CUDA_DOCKER_ARCH}, build ${BUILD_NUMBER}, commit ${GITHUB_SHA}"
+            echo
+            echo '```'
+            echo "${RUNTIME_TAGS}"
+            if [[ -n "${PROFILING_TAGS}" ]]; then echo "${PROFILING_TAGS}"; fi
+            echo '```'
+            echo
+            echo "On the GPU host: \`LLAMA_TAG=<tag> docker compose -f deploy/5090/docker-compose.yml pull\` (see deploy/5090/README.md)."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          BUILD_NUMBER: ${{ steps.image.outputs.build_number }}
+          RUNTIME_TAGS: ${{ steps.meta.outputs.tags }}
+          PROFILING_TAGS: ${{ steps.meta_profiling.outputs.tags }}

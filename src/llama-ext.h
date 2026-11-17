@@ -189,6 +189,13 @@ LLAMA_API bool llama_set_embeddings_nextn_dev(struct llama_context * ctx, bool v
 LLAMA_API bool llama_get_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, float * out);
 LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, const float * data);
 
+// Copy rows of the h_nextn device buffer to other rows of the same buffer (device-to-device),
+// ordered after the last decode that wrote the source rows and visible to the next readers.
+// Used by the MTP speculative implementation to keep the pending rows on the device, instead of
+// round-tripping them through host memory at every catch-up, accept and draft step.
+// Returns false if the buffer cannot be used.
+LLAMA_API bool llama_copy_embeddings_nextn_rows(struct llama_context * ctx, int64_t row_dst, int64_t row_src, int64_t n_rows);
+
 // Read the state rows of batches (see llama_batch_ext_set_embd_state_row()) from the h_nextn device buffer of src.
 // Returns whether decode accepts batches with state rows.
 LLAMA_API bool llama_set_embd_state_src(struct llama_context * ctx, struct llama_context * src);

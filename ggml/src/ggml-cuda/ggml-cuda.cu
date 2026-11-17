@@ -81,10 +81,12 @@
 #include <atomic>
 #include <charconv>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -152,6 +154,11 @@ static int ggml_cuda_env_int(const char * name, int default_value) {
     return env != nullptr ? std::atoi(env) : default_value;
 }
 
+static double ggml_cuda_env_double(const char * name, double default_value) {
+    const char * env = getenv(name);
+    return env != nullptr ? std::strtod(env, nullptr) : default_value;
+}
+
 static bool ggml_cuda_env_set(const char * name) {
     return getenv(name) != nullptr;
 }
@@ -189,6 +196,69 @@ bool ggml_cuda_pool_debug_enabled() {
 static int ggml_cuda_op_offload_min_batch() {
     static const int min_batch = ggml_cuda_env_int("GGML_OP_OFFLOAD_MIN_BATCH", 32);
     return min_batch;
+}
+
+// Theoretical PCIe link bandwidth in GB/s for a device, read from sysfs:
+//   /sys/bus/pci/devices/<pci_bus_id>/current_link_speed   (GT/s, e.g. "15.751 GT/s")
+//   /sys/bus/pci/devices/<pci_bus_id>/current_link_width   (lanes, e.g. "4")
+// Effective GB/s = lanes * GT/s / 8 * encoding, with 8b/10b for Gen 1/2 and
+// 128b/130b for Gen 3+ (e.g. PCIe 4.0 x4: 15.751 * 4 / 8 * 128/130 = 7.9 GB/s).
+// GGML_CUDA_PCIE_GBPS overrides the sysfs read (and is the only source on
+// systems without sysfs, e.g. Windows). Returns 0.0 when unknown.
+static double ggml_cuda_pcie_link_bandwidth_gbps(const char * pci_bus_id) {
+    const char * env = getenv("GGML_CUDA_PCIE_GBPS");
+    if (env != nullptr) {
+        const double bw = std::strtod(env, nullptr);
+        if (bw > 0.0) {
+            return bw;
+        }
+    }
+
+    double gt_s  = 0.0;
+    int    width = 0;
+    {
+        std::ifstream f(std::string("/sys/bus/pci/devices/") + pci_bus_id + "/current_link_speed");
+        if (f.is_open()) {
+            f >> gt_s;
+        }
+    }
+    {
+        std::ifstream f(std::string("/sys/bus/pci/devices/") + pci_bus_id + "/current_link_width");
+        if (f.is_open()) {
+            f >> width;
+        }
+    }
+    if (gt_s > 0.0 && width > 0) {
+        const double encoding = gt_s < 10.0 ? 0.8 : 128.0 / 130.0;  // 8b/10b vs 128b/130b
+        return width * gt_s * encoding / 8.0;
+    }
+    return 0.0;
+}
+
+// GGML_CUDA_OP_OFFLOAD_AUTO: derive GGML_OP_OFFLOAD_MIN_BATCH from the link
+// bandwidth when the env var is not set explicitly.
+//
+// The upload-vs-CPU threshold is n_min ~ (bytes / BW_link) / t_cpu_per_row:
+// a slow link pushes the threshold up, a slow CPU pushes it down. The base of
+// 32 was tuned for ~x16 links; 25 GB/s and 100 GFLOPS are the reference values
+// of that tuning (GGML_CUDA_CPU_GFLOPS overrides the CPU reference with a
+// measured value). The formula and constants are to be confirmed by the LL-7
+// sweep.
+static int ggml_cuda_op_offload_min_batch_auto(double bw_gbps) {
+    static const double BW_REF_GBPS    = 25.0;
+    static const double CPU_REF_GFLOPS = 100.0;
+    static const int    MIN_BATCH_BASE = 32;
+
+    double n = MIN_BATCH_BASE * (BW_REF_GBPS / bw_gbps);
+
+    const double cpu_gflops = ggml_cuda_env_double("GGML_CUDA_CPU_GFLOPS", CPU_REF_GFLOPS);
+    if (cpu_gflops > 0.0) {
+        n *= cpu_gflops / CPU_REF_GFLOPS;
+    }
+
+    n = std::round(n);
+    n = std::max(8.0, std::min(512.0, n));
+    return (int) n;
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -6889,11 +6959,13 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
         static std::mutex mutex;
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
-            ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
-            const int min_batch_size = ggml_cuda_op_offload_min_batch();
+            ggml_backend_cuda_reg_context * ctx                    = new ggml_backend_cuda_reg_context;
+            const int                       min_batch_size_default = ggml_cuda_op_offload_min_batch();
+            const bool                      op_offload_auto =
+                ggml_cuda_env_flag("GGML_CUDA_OP_OFFLOAD_AUTO") && getenv("GGML_OP_OFFLOAD_MIN_BATCH") == nullptr;
 
-            const ggml_cuda_device_info & info = ggml_cuda_info();
-            const bool virtual_devices = info.device_count > info.physical_device_count;
+            const ggml_cuda_device_info & info            = ggml_cuda_info();
+            const bool                    virtual_devices = info.device_count > info.physical_device_count;
 
             for (int i = 0; i < info.device_count; i++) {
                 const int physical_id = info.devices[i].physical_device;
@@ -6906,12 +6978,32 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 char pci_bus_id[32] = {};
                 CUDA_CHECK(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), physical_id));
                 dev_ctx->pci_bus_id = pci_bus_id;
+                for (char & c : pci_bus_id) {
+                    c = std::tolower(c);
+                }
                 if (virtual_devices) {
                     // make the pci bus id unique for virtual devices
                     dev_ctx->pci_bus_id += "-v" + std::to_string(i);
                 }
-                for (char & c : dev_ctx->pci_bus_id) {
-                    c = std::tolower(c);
+
+                const double bw_gbps = ggml_cuda_pcie_link_bandwidth_gbps(pci_bus_id);
+                if (bw_gbps > 0.0) {
+                    GGML_LOG_INFO("%s: PCIe link %s: %.2f GB/s theoretical\n", dev_ctx->name.c_str(), pci_bus_id,
+                                  bw_gbps);
+                }
+
+                int min_batch_size = min_batch_size_default;
+                if (op_offload_auto) {
+                    if (bw_gbps > 0.0) {
+                        min_batch_size = ggml_cuda_op_offload_min_batch_auto(bw_gbps);
+                        GGML_LOG_INFO("%s: GGML_CUDA_OP_OFFLOAD_AUTO: op_offload_min_batch = %d (link %.2f GB/s)\n",
+                                      dev_ctx->name.c_str(), min_batch_size, bw_gbps);
+                    } else {
+                        GGML_LOG_WARN(
+                            "%s: GGML_CUDA_OP_OFFLOAD_AUTO: PCIe bandwidth unknown (set GGML_CUDA_PCIE_GBPS); "
+                            "keeping op_offload_min_batch = %d\n",
+                            dev_ctx->name.c_str(), min_batch_size);
+                    }
                 }
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
 

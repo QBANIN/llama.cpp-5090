@@ -188,6 +188,9 @@ LLAMA_API bool llama_set_embeddings_nextn_dev(struct llama_context * ctx, bool v
 // Copy rows of the h_nextn device buffer to or from host memory, ordered after the last decode and its readers
 LLAMA_API bool llama_get_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, float * out);
 LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, const float * data);
+// Copy rows of the h_nextn device buffer from one context to another (device-to-device).
+// Both contexts must have llama_set_embeddings_nextn_dev() enabled and be on compatible backends.
+LLAMA_API bool llama_h_nextn_dev_copy_rows(struct llama_context * src_ctx, int64_t src_row0, struct llama_context * dst_ctx, int64_t dst_row0, int64_t n_rows);
 
 // Read the state rows of batches (see llama_batch_ext_set_embd_state_row()) from the h_nextn device buffer of src.
 // Returns whether decode accepts batches with state rows.

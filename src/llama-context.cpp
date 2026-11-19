@@ -1651,6 +1651,39 @@ bool llama_context::set_h_nextn_rows(int64_t row0, int64_t n_rows, const float *
     ggml_backend_tensor_set(h_nextn_dev, data, row0*h_nextn_dev->nb[1], n_rows*h_nextn_dev->nb[1]);
     return true;
 }
+bool llama_context::copy_h_nextn_dev_rows(const llama_context * src, int64_t src_row0, int64_t dst_row0, int64_t n_rows) {
+    if (h_nextn_dev == nullptr || src->h_nextn_dev == nullptr) {
+        return false;
+    }
+    if (src_row0 < 0 || dst_row0 < 0 || n_rows <= 0) {
+        return false;
+    }
+    if (src_row0 + n_rows > src->h_nextn_dev->ne[1] || dst_row0 + n_rows > h_nextn_dev->ne[1]) {
+        return false;
+    }
+    const int64_t n_embd = h_nextn_dev->ne[0];
+    if (src->h_nextn_dev->ne[0] != n_embd) {
+        return false;
+    }
+    ggml_backend_t b_src = src->h_nextn_backend;
+    ggml_backend_t b_dst = h_nextn_backend;
+    if (b_src == nullptr || b_dst == nullptr) {
+        return false;
+    }
+    const size_t n_bytes = (size_t) n_rows * n_embd * sizeof(float);
+    // create a throwaway ggml context with two 1D views pointing at the row ranges
+    ggml_context_ptr ctx_v(ggml_init({ n_bytes, nullptr, false }));
+    auto * v_src = ggml_new_tensor_1d(ctx_v.get(), GGML_TYPE_F32, n_rows * n_embd);
+    auto * v_dst = ggml_new_tensor_1d(ctx_v.get(), GGML_TYPE_F32, n_rows * n_embd);
+    v_src->data   = (void *) ((const char *) src->h_nextn_dev->data + src_row0 * src->h_nextn_dev->nb[1]);
+    v_dst->data   = (void *) ((char *)       h_nextn_dev->data     + dst_row0 * h_nextn_dev->nb[1]);
+    v_src->nb[0]  = sizeof(float);
+    v_dst->nb[0]  = sizeof(float);
+    v_src->buffer = src->h_nextn_dev->buffer;
+    v_dst->buffer = h_nextn_dev->buffer;
+    ggml_backend_tensor_copy_async(b_src, b_dst, v_src, v_dst);
+    return true;
+}
 
 bool llama_context::set_state_src(llama_context * src) {
     if (cparams.ctx_state_src != src) {
@@ -4755,6 +4788,10 @@ bool llama_get_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t 
 
 bool llama_set_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t n_rows, const float * data) {
     return ctx->set_h_nextn_rows(row0, n_rows, data);
+}
+
+bool llama_h_nextn_dev_copy_rows(llama_context * src_ctx, int64_t src_row0, llama_context * dst_ctx, int64_t dst_row0, int64_t n_rows) {
+    return dst_ctx->copy_h_nextn_dev_rows(src_ctx, src_row0, dst_row0, n_rows);
 }
 
 bool llama_set_embd_state_src(llama_context * ctx, llama_context * src) {

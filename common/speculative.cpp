@@ -1567,6 +1567,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
     // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
     bool    dev_rows    = false;
+    bool    dev_rows_self = false; // draft's own h_nextn_dev enabled: D2D copy in the draft loop instead of D2H+H2D
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
@@ -1651,6 +1652,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // shared memory and chained heads keep the host rows
         if (!is_mem_shared && !chain_heads) {
             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_embd_state_src(ctx_dft, ctx_tgt);
+            if (dev_rows) {
+                // also enable the draft's own h_nextn device buffer so the MTP graph writes output rows there;
+                // the draft loop then D2D-copies the row into a reserved slot of the target buffer for state_row
+                dev_rows_self = llama_set_embeddings_nextn_dev(ctx_dft, true);
+                if (!dev_rows_self) {
+                    SPC_TRC("%s", "- draft h_nextn_dev unavailable, falling back to host rows in the draft loop\n");
+                }
+            }
             if (!dev_rows) {
                 llama_set_embd_state_src(ctx_dft, nullptr);
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
@@ -1664,6 +1673,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (dev_rows) {
             llama_set_embd_state_src(ctx_dft, nullptr);
             llama_set_embeddings_nextn_dev(this->params.ctx_tgt, false);
+            if (dev_rows_self) {
+                llama_set_embeddings_nextn_dev(ctx_dft, false);
+            }
         }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1926,7 +1938,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                // h_row is only needed for chain_heads (host-side chain) and is_mem_shared;
+                // the else path with dev_rows_self uses a D2D copy + state_row instead
+                const float * h_row = (chain_heads || is_mem_shared || !dev_rows_self) ? llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]) : nullptr;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1983,7 +1997,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     i_last[seq_id] = idx;
                 } else {
                     const int32_t idx = batch.add(id, dp.pos0 + i + 1, seq_id, true);
-                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+                    if (dev_rows_self) {
+                        // D2D copy the draft's h_nextn row into a reserved slot of the target buffer,
+                        // then point the state_row at it: no PCIe traffic for this step
+                        const int32_t dst_row = n_batch_tgt + n_seq + seq_id;
+                        llama_h_nextn_dev_copy_rows(ctx_dft, i_last[seq_id], params.ctx_tgt, dst_row, 1);
+                        batch.set_embd_state_row(idx, dst_row);
+                    } else {
+                        batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+                    }
                     i_last[seq_id] = idx;
                 }
             }
